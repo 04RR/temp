@@ -1,112 +1,154 @@
-import os
-import torch
-import torch.nn as nn
+from segment_anything import SamPredictor, sam_model_registry
+import matplotlib.pyplot as plt
 from PIL import Image
-from torch.utils.data import Dataset
-from torch.nn.functional import cosine_similarity
+import numpy as np
+import torch
+from torch.nn import functional as F
+from torchvision.transforms.functional import resize, to_pil_image
+from copy import deepcopy
+from typing import Tuple
 
 
-class ContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.5):
-        super(ContrastiveLoss, self).__init__()
-        self.temperature = temperature
+class ResizeLongestSide:
+    """
+    Resizes images to the longest side 'target_length', as well as provides
+    methods for resizing coordinates and boxes. Provides methods for
+    transforming both numpy array and batched torch tensors.
+    """
 
-    def forward(self, z1, z2, flag=True):
-        z1 = nn.functional.normalize(z1, dim=1)
-        z2 = nn.functional.normalize(z2, dim=1)
-        similarity_matrix = cosine_similarity(z1, z2, dim=-1)
+    def __init__(self, target_length: int) -> None:
+        self.target_length = target_length
 
-        if flag:
-            logits = similarity_matrix / self.temperature
-        else:
-            logits = -similarity_matrix / self.temperature  # Negative pairs
+    def apply_image(self, image: np.ndarray) -> np.ndarray:
+        """
+        Expects a numpy array with shape HxWxC in uint8 format.
+        """
+        target_size = self.get_preprocess_shape(
+            image.shape[0], image.shape[1], self.target_length
+        )
+        return np.array(resize(to_pil_image(image), target_size))
 
-        return logits
+    def apply_coords(
+        self, coords: np.ndarray, original_size: Tuple[int, ...]
+    ) -> np.ndarray:
+        """
+        Expects a numpy array of length 2 in the final dimension. Requires the
+        original image size in (H, W) format.
+        """
+        old_h, old_w = original_size
+        new_h, new_w = self.get_preprocess_shape(
+            original_size[0], original_size[1], self.target_length
+        )
+        coords = deepcopy(coords).astype(float)
+        coords[..., 0] = coords[..., 0] * (new_w / old_w)
+        coords[..., 1] = coords[..., 1] * (new_h / old_h)
+        return coords
+
+    def apply_boxes(
+        self, boxes: np.ndarray, original_size: Tuple[int, ...]
+    ) -> np.ndarray:
+        """
+        Expects a numpy array shape Bx4. Requires the original image size
+        in (H, W) format.
+        """
+        boxes = self.apply_coords(boxes.reshape(-1, 2, 2), original_size)
+        return boxes.reshape(-1, 4)
+
+    def apply_image_torch(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Expects batched images with shape BxCxHxW and float format. This
+        transformation may not exactly match apply_image. apply_image is
+        the transformation expected by the model.
+        """
+        # Expects an image in BCHW format. May not exactly match apply_image.
+        target_size = self.get_preprocess_shape(
+            image.shape[2], image.shape[3], self.target_length
+        )
+        return F.interpolate(
+            image, target_size, mode="bilinear", align_corners=False, antialias=True
+        )
+
+    def apply_coords_torch(
+        self, coords: torch.Tensor, original_size: Tuple[int, ...]
+    ) -> torch.Tensor:
+        """
+        Expects a torch tensor with length 2 in the last dimension. Requires the
+        original image size in (H, W) format.
+        """
+        old_h, old_w = original_size
+        new_h, new_w = self.get_preprocess_shape(
+            original_size[0], original_size[1], self.target_length
+        )
+        coords = deepcopy(coords).to(torch.float)
+        coords[..., 0] = coords[..., 0] * (new_w / old_w)
+        coords[..., 1] = coords[..., 1] * (new_h / old_h)
+        return coords
+
+    def apply_boxes_torch(
+        self, boxes: torch.Tensor, original_size: Tuple[int, ...]
+    ) -> torch.Tensor:
+        """
+        Expects a torch tensor with shape Bx4. Requires the original image
+        size in (H, W) format.
+        """
+        boxes = self.apply_coords_torch(boxes.reshape(-1, 2, 2), original_size)
+        return boxes.reshape(-1, 4)
+
+    @staticmethod
+    def get_preprocess_shape(
+        oldh: int, oldw: int, long_side_length: int
+    ) -> Tuple[int, int]:
+        """
+        Compute the output size given input size and target long side length.
+        """
+        scale = long_side_length * 1.0 / max(oldh, oldw)
+        newh, neww = oldh * scale, oldw * scale
+        neww = int(neww + 0.5)
+        newh = int(newh + 0.5)
+        return (newh, neww)
 
 
-def resize_to_nearest_multiple_of_14(image_path):
-    img = Image.open(image_path)
-
-    width, height = img.size
-
-    new_width = max(round(width / 14) * 14, 14)
-    new_height = max(round(height / 14) * 14, 14)
-
-    resized_img = img.resize((new_width, new_height), Image.LANCZOS)
-
-    return resized_img
-
-
-class ContrastiveDataset(Dataset):
-    def __init__(self, path, transform=None):
-        self.path = path
-        self.transform = transform
-        self.folders = os.listdir(path)
-
-    def __getitem__(self, index):
-        rand_num = torch.rand(1)
-
-        if rand_num > 0.5:
-            folder = torch.randint(0, 5, (1,))
-            folder = self.folders[folder]
-
-            img1 = torch.randint(0, 750, (1,))
-            img2 = torch.randint(0, 750, (1,))
-
-            img1 = os.listdir(self.path + folder)[img1]
-            img2 = os.listdir(self.path + folder)[img2]
-
-            im1 = resize_to_nearest_multiple_of_14(
-                self.path + str(folder) + "/" + str(img1)
-            )
-            im2 = resize_to_nearest_multiple_of_14(
-                self.path + str(folder) + "/" + str(img2)
-            )
-            flag = True
-
-        else:
-            folder1 = torch.randint(0, 5, (1,))
-            folder2 = torch.randint(0, 5, (1,))
-
-            while folder1 == folder2:
-                folder2 = torch.randint(0, 5, (1,))
-
-            folder1 = self.folders[folder1]
-            folder2 = self.folders[folder2]
-
-            img1 = torch.randint(0, 750, (1,))
-            img2 = torch.randint(0, 750, (1,))
-
-            img1 = os.listdir(self.path + folder1)[img1]
-            img2 = os.listdir(self.path + folder2)[img2]
-
-            im1 = resize_to_nearest_multiple_of_14(
-                self.path + str(folder1) + "/" + str(img1)
-            )
-            im2 = resize_to_nearest_multiple_of_14(
-                self.path + str(folder2) + "/" + str(img2)
-            )
-            flag = False
-
-        if self.transform:
-            im1 = self.transform(im1)
-            im2 = self.transform(im2)
-
-        return torch.tensor(im1).float(), torch.tensor(im2).float(), flag
-
-    def __len__(self):
-        return 10000
+def expand2square(pil_img, background_color=(127, 127, 127)):
+    width, height = pil_img.size
+    if width == height:
+        return pil_img
+    elif width > height:
+        result = Image.new(pil_img.mode, (width, width), background_color)
+        result.paste(pil_img, (0, (width - height) // 2))
+        return result
+    else:
+        result = Image.new(pil_img.mode, (height, height), background_color)
+        result.paste(pil_img, ((height - width) // 2, 0))
+        return result
 
 
-class ProjModel(nn.Module):
-    def __init__(self, in_dim, out_dim, depth):
-        super().__init__()
-        
-        layers = [nn.Linear(in_dim, out_dim)]
-        for _ in range(depth - 1):
-            layers.append(nn.Linear(out_dim, out_dim))
-        
-        self.model = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.model(x)
+def load_encoder(model_type="vit_l", device="cuda"):
+    sam = sam_model_registry[model_type](
+        checkpoint=f"/mnt/d/rr/image-encoder/model_ckpts/sam_{model_type}.pth"
+    )
+
+    image_encoder = sam.image_encoder
+    image_encoder = image_encoder.to(device)
+
+    del sam
+
+    return image_encoder
+
+
+def load_image(path, device="cuda", target_size=1024):
+    img = Image.open(path).convert("RGB")
+
+    w, h = img.size
+    scale = target_size / max(w, h)
+    new_w, new_h = int(w * scale), int(h * scale)
+
+    img = img.resize((new_w, new_h))
+    img = expand2square(img)
+
+    img = torch.tensor(np.array(img))
+
+    pixel_mean = torch.tensor([123.675, 116.28, 103.53])
+    pixel_std = torch.tensor([58.395, 57.12, 57.375])
+    img = (img - pixel_mean) / pixel_std
+
+    return img.permute(2, 0, 1).contiguous().to(device)
